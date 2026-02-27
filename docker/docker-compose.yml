@@ -1,0 +1,49 @@
+version: "3.9"
+
+# Account × Workers model:
+#   - One container per Claude account (CLAUDE_CONFIG_DIR = separate auth / 5-hour limit)
+#   - N worker processes inside each container (start_workers.sh, ports BASE_PORT .. BASE_PORT+N-1)
+#   - Pool service routes across ALL (num_accounts × WORKERS_PER_ACCOUNT) workers
+#     complete() uses round-robin (even account distribution); sessions use EWMA + affinity
+#
+# To add more accounts: add account-3, account-4 services and append to ACCOUNT_BASE_URLS.
+# To add more workers per account: increase WORKERS_PER_ACCOUNT (and expose extra ports if > 3).
+
+services:
+  pool-service:
+    build:
+      context: ..                              # repo root — needed to COPY claude_cli_pool/
+      dockerfile: docker/pool_service/Dockerfile
+    ports:
+      - "8090:8000"                            # single external endpoint
+    environment:
+      ACCOUNT_BASE_URLS: "http://account-1,http://account-2"
+      WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-3}"
+      BASE_PORT: "8000"
+      MODEL: "claude-sonnet-4-6"
+      TIMEOUT: "300"
+      MAX_TOKENS: "8192"
+    depends_on:
+      - account-1
+      - account-2
+
+  account-1:
+    build: ./claude_worker
+    # No published ports — internal docker network only
+    volumes:
+      - ${CLAUDE_CONFIG_DIR_1:-~/.claude}:/root/.claude
+    environment:
+      WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-3}"
+      BASE_PORT: "8000"
+      MAX_CONCURRENT: "1"
+      CLAUDE_CONFIG_DIR: /root/.claude
+
+  account-2:
+    build: ./claude_worker
+    volumes:
+      - ${CLAUDE_CONFIG_DIR_2:-~/.claude}:/root/.claude
+    environment:
+      WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-3}"
+      BASE_PORT: "8000"
+      MAX_CONCURRENT: "1"
+      CLAUDE_CONFIG_DIR: /root/.claude
