@@ -96,17 +96,25 @@ async def startup() -> None:
     logger.info(f"Pool service started: {len(worker_urls)} workers")
 
 
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if _pool:
+        await _pool.close()
+
+
 # -- Request models --
 
 class CompleteRequest(BaseModel):
     prompt: str
     system_prompt: str = ""
+    model: str = ""  # per-request override; empty = use pool default
 
 
 class SessionRequest(BaseModel):
     session_id: str
     prompt: str
     system_prompt: str = ""
+    model: str = ""  # per-request override; empty = use pool default
 
 
 class ResumeRequest(BaseModel):
@@ -124,7 +132,7 @@ async def health() -> dict:
 
 @app.post("/complete")
 async def complete(req: CompleteRequest) -> dict:
-    resp = await _pool.complete(req.prompt, req.system_prompt)
+    resp = await _pool.complete(req.prompt, req.system_prompt, model=req.model)
     if resp.error:
         raise HTTPException(status_code=500, detail=resp.error)
     return {"content": resp.content}
@@ -133,7 +141,7 @@ async def complete(req: CompleteRequest) -> dict:
 @app.post("/start_session")
 async def start_session(req: SessionRequest) -> dict:
     session_uuid = _to_uuid(req.session_id)
-    resp = await _pool.start_session(session_uuid, req.prompt, req.system_prompt)
+    resp = await _pool.start_session(session_uuid, req.prompt, req.system_prompt, model=req.model)
     if resp.error:
         raise HTTPException(status_code=500, detail=resp.error)
     return {"content": resp.content}

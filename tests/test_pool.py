@@ -139,6 +139,6 @@ async def test_workers_not_externally_accessible():
                             f"Claude worker is accessible on host port :8000 — "
                             "workers should have no published ports. Response: {data}"
                         )
-                    # Some other service on :8000 (e.g. linvest21 API) — that's fine
+                    # Some other service on :8000 — that's fine
     except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
         pass  # No service on :8000 — workers are internal only (ideal case)

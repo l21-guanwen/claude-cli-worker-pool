@@ -271,6 +271,9 @@ even distribution across accounts over time.
 // Request
 {"prompt": "What is 2+2?", "system_prompt": "You are a math tutor."}
 
+// Request with per-request model override (faster, see Latency section)
+{"prompt": "Score 1-10.", "model": "claude-haiku-4-5-20251001"}
+
 // Response
 {"content": "4"}
 ```
@@ -287,6 +290,9 @@ transparently (Claude CLI requires valid UUIDs for `--session-id`).
 // Request
 {"session_id": "eval-001", "prompt": "Analyze AAPL.", "system_prompt": "You are an analyst."}
 
+// Request with per-request model override
+{"session_id": "eval-001", "prompt": "Analyze AAPL.", "model": "claude-haiku-4-5-20251001"}
+
 // Response
 {"content": "..."}
 ```
@@ -294,6 +300,7 @@ transparently (Claude CLI requires valid UUIDs for `--session-id`).
 ### `POST /resume_session`
 
 Continue an existing session. Automatically routed to the **pinned worker** for that session ID.
+Model is carried forward from `start_session` — no override here.
 
 ```json
 // Request
@@ -334,9 +341,6 @@ async def run_eval():
 
 asyncio.run(run_eval())
 ```
-
-For linvest21 integration, see [`examples/linvest21_adapter.py`](examples/linvest21_adapter.py)
-— a thin `BaseLLMProvider` wrapper that calls the pool service over HTTP.
 
 ---
 
@@ -404,6 +408,65 @@ session state as a local file, so the resume must hit the exact same process.
 
 ---
 
+## Latency
+
+### Where the time goes
+
+Each `claude -p` call averages ~16s. The breakdown:
+
+| Source | Time | % | Can reduce? |
+|--------|------|---|-------------|
+| Anthropic API (model inference) | 10-12s | 65-75% | Use a faster model |
+| Node.js subprocess spawn + CLI init | 2-3s | 15-20% | No — Claude CLI is one-shot by design |
+| JSON/HTTP overhead | 1-2s | ~10% | Negligible |
+
+The subprocess overhead is unavoidable — both the Python and TypeScript Claude SDKs spawn a fresh
+Node.js process per call internally. There is no persistent daemon mode for `claude -p`.
+
+### CLI vs API latency
+
+This pool uses `claude -p` (CLI binary via subscription login), not the Anthropic API. Same model,
+same backend, but the CLI adds ~3-4s overhead per call:
+
+| Source | CLI (`claude -p`) | API (`anthropic.messages.create`) |
+|--------|:-:|:-:|
+| Node.js process spawn | ~2-3s | 0 |
+| CLI init + config load | ~0.5-1s | 0 |
+| Model inference (Sonnet) | 10-12s | 10-12s |
+| **Total** | **~14-16s** | **~10-12s** |
+
+The tradeoff:
+- **CLI (this pool)**: Free (subscription), 5-hour token budget per account, no API key needed
+- **API**: Pay per token, no time limit, ~25% faster per call
+
+### Per-request model override
+
+The only lever that meaningfully reduces latency is **model selection**. Haiku inference is
+~3-5s vs Sonnet's ~10-12s. For scoring/grading tasks, Haiku is often sufficient.
+
+Pass `"model"` in any `/complete` or `/start_session` request to override the pool default:
+
+```bash
+# Default model (~14-16s)
+curl -X POST http://localhost:8090/complete \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Score this 1-10: [response]"}'
+
+# Haiku override (~6-9s)
+curl -X POST http://localhost:8090/complete \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Score this 1-10: [response]", "model": "claude-haiku-4-5-20251001"}'
+```
+
+If `model` is empty or omitted, the pool uses the `MODEL` env var (default: `claude-sonnet-4-6`).
+
+| Model | Avg round-trip | Best for |
+|-------|---------------|----------|
+| `claude-sonnet-4-6` | ~14-16s | Complex analysis, nuanced rubric evaluation |
+| `claude-haiku-4-5-20251001` | ~6-9s | Binary scoring, numeric grading, format checks |
+
+---
+
 ## Configuration Reference
 
 **Pool service** (`docker-compose.yml` → `pool-service`):
@@ -413,7 +476,7 @@ session state as a local file, so the resume must hit the exact same process.
 | `ACCOUNT_BASE_URLS` | required | Comma-separated account container base URLs (no port), e.g. `http://account-1,http://account-2` |
 | `WORKERS_PER_ACCOUNT` | `1` | Worker processes per account container |
 | `BASE_PORT` | `8000` | Starting port; workers listen on `BASE_PORT`, `BASE_PORT+1`, … |
-| `MODEL` | `claude-sonnet-4-6` | Claude model ID |
+| `MODEL` | `claude-sonnet-4-6` | Default Claude model (overridable per-request via `"model"` field) |
 | `TIMEOUT` | `300` | Per-request timeout (seconds) |
 | `MAX_TOKENS` | `8192` | Max tokens per response |
 | `WORKER_URLS` | — | Override: flat comma-separated list of worker URLs (skips `ACCOUNT_BASE_URLS` expansion) |
@@ -471,8 +534,6 @@ claude-cli-worker-pool/
 │   ├── __init__.py
 │   └── pool.py                  WorkerClient (EWMA + request counter) + ClaudeCLIPool
 │                                  (round-robin for /complete, EWMA for /start_session, pinned for /resume_session)
-├── examples/
-│   └── linvest21_adapter.py     BaseLLMProvider adapter for linvest21 integration
 ├── tests/
 │   └── test_pool.py             Integration tests (5 tests, require docker compose up)
 ├── requirements.txt             aiohttp>=3.9.0

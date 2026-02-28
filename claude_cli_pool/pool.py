@@ -57,6 +57,7 @@ class WorkerClient:
         self._total_requests = 0
         self._avg_response_ms = _INITIAL_RESPONSE_MS
         self._is_healthy = True  # updated by pool health checks
+        self._session: aiohttp.ClientSession | None = None  # lazy singleton
 
     @property
     def active(self) -> int:
@@ -86,12 +87,25 @@ class WorkerClient:
             _EWMA_ALPHA * elapsed_ms + (1 - _EWMA_ALPHA) * self._avg_response_ms
         )
 
+    def _get_session(self, timeout: float = 300.0) -> aiohttp.ClientSession:
+        """Lazily create and reuse a single ClientSession per worker."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout + 10),
+            )
+        return self._session
+
+    async def close(self) -> None:
+        """Close the persistent HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
     async def health(self) -> bool:
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-                async with s.get(f"{self._url}/health") as r:
-                    self._is_healthy = r.status == 200
-                    return self._is_healthy
+            s = self._get_session(timeout=5)
+            async with s.get(f"{self._url}/health") as r:
+                self._is_healthy = r.status == 200
+                return self._is_healthy
         except Exception:
             self._is_healthy = False
             return False
@@ -147,16 +161,15 @@ class WorkerClient:
             t0 = time.monotonic()
             success = False
             try:
-                client_timeout = aiohttp.ClientTimeout(total=timeout + 10)
-                async with aiohttp.ClientSession(timeout=client_timeout) as s:
-                    async with s.post(f"{self._url}{endpoint}", json=payload) as r:
-                        if r.status != 200:
-                            text = await r.text()
-                            # Don't update EWMA on errors — they skew latency down
-                            return PoolResponse(content="", error=f"{r.status}: {text}")
-                        data = await r.json()
-                        success = True
-                        return PoolResponse(content=data.get("content", ""))
+                s = self._get_session(timeout)
+                async with s.post(f"{self._url}{endpoint}", json=payload) as r:
+                    if r.status != 200:
+                        text = await r.text()
+                        # Don't update EWMA on errors — they skew latency down
+                        return PoolResponse(content="", error=f"{r.status}: {text}")
+                    data = await r.json()
+                    success = True
+                    return PoolResponse(content=data.get("content", ""))
             except Exception as e:
                 return PoolResponse(content="", error=str(e))
             finally:
@@ -232,7 +245,7 @@ class ClaudeCLIPool:
             logger.debug(f"[pool] Picked worker-{best_idx} (score={best_score:.0f})")
         return best_idx
 
-    async def complete(self, prompt: str, system_prompt: str = "") -> PoolResponse:
+    async def complete(self, prompt: str, system_prompt: str = "", model: str = "") -> PoolResponse:
         # Round-robin across all workers for stateless calls — ensures even account usage.
         # EWMA scoring is not used here because it tends to cluster on low-index workers,
         # starving higher-index workers (and their accounts) of traffic.
@@ -244,7 +257,7 @@ class ClaudeCLIPool:
         return await worker.complete(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=self._model,
+            model=model or self._model,
             max_tokens=self._max_tokens,
             timeout=self._timeout,
         )
@@ -254,6 +267,7 @@ class ClaudeCLIPool:
         session_id: str,
         prompt: str,
         system_prompt: str = "",
+        model: str = "",
     ) -> PoolResponse:
         async with self._lock:
             worker_idx = self._pick_worker()
@@ -267,7 +281,7 @@ class ClaudeCLIPool:
             session_id=session_id,
             prompt=prompt,
             system_prompt=system_prompt,
-            model=self._model,
+            model=model or self._model,
             max_tokens=self._max_tokens,
             timeout=self._timeout,
         )
@@ -303,6 +317,10 @@ class ClaudeCLIPool:
             "total": len(self._workers),
             "workers": worker_stats,
         }
+
+    async def close(self) -> None:
+        """Close all worker HTTP sessions."""
+        await asyncio.gather(*[w.close() for w in self._workers])
 
     @property
     def worker_count(self) -> int:
