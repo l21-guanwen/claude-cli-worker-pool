@@ -56,6 +56,8 @@ account-1 (~/.claude-acct1)          account-2 (~/.claude-acct2)
 - **Single external endpoint** — clients call `:8090` only; workers have no published ports.
 - **Hybrid execution** — `/complete` uses one-shot `subprocess.run`; sessions use persistent
   streaming subprocesses (`--input-format stream-json`) that stay alive between messages.
+- **Warm process pool** — pre-spawns streaming processes on startup so `/start_session` grabs
+  one instantly (~0s) instead of spawning on-demand (~3-4s). Eagerly replenishes after each use.
 - **Round-robin for stateless calls** — `/complete` cycles worker-0 → worker-1 → … → worker-N
   → worker-0, ensuring even distribution across all accounts.
 - **EWMA routing for new sessions** — `/start_session` picks the fastest, least-loaded worker
@@ -432,48 +434,41 @@ affinity map. Optional — idle sessions are auto-cleaned after `SESSION_IDLE_TI
 
 ## Latency
 
-### Streaming mode — the key optimization
+### Two optimizations
 
-Sessions use **streaming input mode** (`--input-format stream-json --output-format stream-json`),
-which keeps the Node.js subprocess alive between messages. This eliminates the ~3-4s subprocess
-spawn overhead on every `/resume_session` call.
+**1. Streaming mode** — sessions use `--input-format stream-json --output-format stream-json`,
+keeping the Node.js subprocess alive between messages. Eliminates ~3-4s subprocess spawn on
+every `/resume_session` call.
+
+**2. Warm process pool** — pre-spawns streaming processes at worker startup. When `/start_session`
+arrives, it grabs one instantly (~0s) instead of spawning on-demand (~3-4s). Eagerly replenishes
+after each acquisition. Falls back to on-demand if the pool is empty.
 
 ```
 /complete:        subprocess.run per call  → spawns, responds, exits  (~5-7s)
-/start_session:   spawn streaming process  → responds, stays alive    (~5-7s, one-time)
+/start_session:   grab warm process (~0s)  → responds, stays alive    (~1-3s with warm pool)
+/start_session:   pool empty, spawn        → responds, stays alive    (~5-7s, on-demand fallback)
 /resume_session:  write to existing stdin  → responds immediately     (~1-8s, no respawn)
 ```
 
-### Per-call breakdown
+### Benchmark: 18-question evaluation
 
-| Source | CLI one-shot | Streaming resume | API (`messages.create`) |
-|--------|:-:|:-:|:-:|
-| Node.js process spawn | ~2-3s | 0 (reused) | 0 |
-| CLI init + config load | ~0.5-1s | 0 (reused) | 0 |
-| Model inference (Sonnet) | ~5-8s | ~5-8s | ~5-8s |
-| **Total** | **~7-12s** | **~5-8s** | **~5-8s** |
+| Metric | Old Session | Streaming (cold) | Streaming + Warm Pool | Independent |
+|--------|:-:|:-:|:-:|:-:|
+| **Wall-clock** | 4m 34s | 3m 10s | **3m 5s** | 3m 24s |
+| Per-question avg | 50.5s | 30.0s | **30.8s** | 35.6s |
+| **Start session avg** | ~15.1s | 6.7s | **3.1s (-53%)** | n/a |
+| Resume session avg | ~10.3s | 6.3s | 7.4s | n/a |
 
-The tradeoff:
-- **CLI streaming (this pool)**: Free (subscription), 5-hour token budget, ~5-8s per resume
-- **CLI one-shot**: Free, ~7-12s per call (subprocess spawn overhead every time)
-- **API**: Pay per token, no time limit, ~5-8s per call
-
-### Benchmark: 18-question evaluation (session scoring)
-
-| Metric | Old Session | Streaming Session | Independent |
-|--------|:-:|:-:|:-:|
-| **Wall-clock** | 4m 34s | **3m 10s** | 3m 24s |
-| Per-question avg | 50.5s | **30.0s** | 35.6s |
-| Start session avg | ~15.1s | **6.7s (-55%)** | n/a |
-| Resume session avg | ~10.3s | **6.3s (-39%)** | n/a |
-
-Streaming session is the fastest mode overall — 31% faster than old session, 7% faster than
-independent. Two consecutive runs showed only ~3% variance.
+Warm pool breakdown (18 start_session calls): 12 warm hits at 2.0s avg, 6 cold misses at 5.4s
+avg (pool exhausted under burst). Overall start avg: 3.1s — 53% faster than cold streaming,
+79% faster than old session.
 
 **When to use each:**
-- **Streaming session** (default): Best for most workloads — lowest per-call latency + token efficient
+- **Streaming + warm pool** (default): Best for most workloads — lowest start + resume latency
+- **Streaming (cold)**: When `WARM_POOL_SIZE=0` or model varies per request
 - **Independent**: Best for very large pools (10+ workers) where parallelism dominates
-- **Old session**: Deprecated — streaming session is strictly better
+- **Old session**: Deprecated — streaming is strictly better
 
 ### Per-request model override
 
@@ -518,6 +513,8 @@ If `model` is empty or omitted, the pool uses the `MODEL` env var (default: `cla
 | `BASE_PORT` | `8000` | Must match the value set in pool-service |
 | `MAX_CONCURRENT` | `1` | Semaphore per worker process (usually leave at 1) |
 | `SESSION_IDLE_TIMEOUT` | `600` | Kill idle streaming sessions after N seconds (default: 10 min) |
+| `WARM_POOL_SIZE` | `2` | Pre-spawned streaming processes per worker (0 to disable) |
+| `WARM_POOL_MODEL` | `claude-sonnet-4-6` | Model for warm processes (must match request model) |
 
 ---
 
@@ -553,7 +550,7 @@ claude-cli-worker-pool/
 │   ├── claude_worker/
 │   │   ├── Dockerfile           Worker image (Node.js + Claude CLI + Python FastAPI)
 │   │   ├── start_workers.sh     Spawns WORKERS_PER_ACCOUNT uvicorn processes on consecutive ports
-│   │   ├── worker_api.py        FastAPI wrapper: one-shot subprocess + streaming sessions
+│   │   ├── worker_api.py        FastAPI wrapper: one-shot subprocess + streaming sessions + warm pool
 │   │   └── requirements.txt
 │   ├── pool_service/
 │   │   ├── Dockerfile           Uses repo-root build context to include claude_cli_pool/

@@ -34,6 +34,8 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 SESSION_IDLE_TIMEOUT = float(os.environ.get("SESSION_IDLE_TIMEOUT", "600"))  # 10 min
+WARM_POOL_SIZE = int(os.environ.get("WARM_POOL_SIZE", "2"))
+WARM_POOL_MODEL = os.environ.get("WARM_POOL_MODEL", "claude-sonnet-4-6")
 
 _semaphore: asyncio.Semaphore | None = None
 _active = 0
@@ -74,33 +76,52 @@ class StreamingSession:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
-    async def start_and_send(self, prompt: str, timeout: float) -> dict:
-        """Spawn the streaming subprocess and send the first user message."""
-        async with self._lock:
-            cmd = [
-                CLAUDE_BIN, "-p",
-                "--input-format", "stream-json",
-                "--output-format", "stream-json",
-                "--verbose",
-                "--model", self._model,
-                "--tools", "",
-            ]
-            env = os.environ.copy()
-            if CLAUDE_CONFIG_DIR:
-                env["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+    async def start_and_send(
+        self,
+        prompt: str,
+        timeout: float,
+        warm_proc: asyncio.subprocess.Process | None = None,
+    ) -> dict:
+        """Start a streaming session and send the first user message.
 
-            logger.info(
-                f"[stream] spawning subprocess for session {self.session_id[:8]}... "
-                f"model={self._model}"
-            )
+        If warm_proc is provided (from WarmProcessPool), reuses it (~0s).
+        Otherwise spawns a new subprocess on-demand (~3-4s).
+        """
+        async with self._lock:
             t0 = time.monotonic()
-            self._proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
+
+            if warm_proc and warm_proc.returncode is None:
+                # Use pre-spawned warm process — skip the ~3-4s spawn
+                self._proc = warm_proc
+                logger.info(
+                    f"[stream] using warm process pid={warm_proc.pid} "
+                    f"for session {self.session_id[:8]} model={self._model}"
+                )
+            else:
+                # Spawn on-demand (original behavior)
+                cmd = [
+                    CLAUDE_BIN, "-p",
+                    "--input-format", "stream-json",
+                    "--output-format", "stream-json",
+                    "--verbose",
+                    "--model", self._model,
+                    "--tools", "",
+                ]
+                env = os.environ.copy()
+                if CLAUDE_CONFIG_DIR:
+                    env["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+                logger.info(
+                    f"[stream] spawning subprocess for session {self.session_id[:8]}... "
+                    f"model={self._model}"
+                )
+                self._proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
 
             # Prepend system context to first message (same as /complete)
             full_prompt = prompt
@@ -112,9 +133,10 @@ class StreamingSession:
 
             result = await self._send_and_read(full_prompt, timeout)
             elapsed = time.monotonic() - t0
+            source = "warm" if warm_proc else "spawned"
             logger.info(
                 f"[stream] session {self.session_id[:8]} started in {elapsed:.1f}s "
-                f"(cli_session={self._cli_session_id})"
+                f"({source}, cli_session={self._cli_session_id})"
             )
             return result
 
@@ -253,6 +275,163 @@ class StreamingSession:
 # Session store: session_id -> StreamingSession
 _sessions: dict[str, StreamingSession] = {}
 _cleanup_task: asyncio.Task | None = None
+_warm_pool: "WarmProcessPool | None" = None
+
+
+# ============================================================
+# Warm Process Pool
+# ============================================================
+
+class WarmProcessPool:
+    """Pre-spawned Claude CLI streaming processes for instant session starts.
+
+    Spawns WARM_POOL_SIZE processes on worker startup. Each sits idle waiting
+    for stdin input. When /start_session arrives, a pre-spawned process is
+    grabbed (~0s) instead of spawning on-demand (~3-4s). A background task
+    eagerly replenishes the pool after each acquisition.
+
+    Only serves requests matching the pool's model. Mismatched models
+    fall back to on-demand spawning.
+    """
+
+    def __init__(self, model: str, pool_size: int) -> None:
+        self._model = model
+        self._pool_size = pool_size
+        self._ready: asyncio.Queue[asyncio.subprocess.Process] = asyncio.Queue()
+        self._replenish_task: asyncio.Task | None = None
+        self._total_spawned = 0
+        self._total_acquired = 0
+
+    async def start(self) -> None:
+        """Pre-spawn processes on worker startup."""
+        if self._pool_size <= 0:
+            logger.info("[warm] warm pool disabled (size=0)")
+            return
+
+        logger.info(f"[warm] pre-spawning {self._pool_size} processes (model={self._model})")
+        t0 = time.monotonic()
+
+        tasks = [self._spawn() for _ in range(self._pool_size)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, asyncio.subprocess.Process) and result.returncode is None:
+                await self._ready.put(result)
+            else:
+                logger.warning(f"[warm] pre-spawn failed: {result}")
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            f"[warm] {self._ready.qsize()}/{self._pool_size} processes ready in {elapsed:.1f}s"
+        )
+
+        self._replenish_task = asyncio.create_task(self._replenish_loop())
+
+    async def _spawn(self) -> asyncio.subprocess.Process:
+        """Spawn a single warm Claude CLI streaming process."""
+        cmd = [
+            CLAUDE_BIN, "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", self._model,
+            "--tools", "",
+        ]
+        env = os.environ.copy()
+        if CLAUDE_CONFIG_DIR:
+            env["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        self._total_spawned += 1
+        logger.debug(f"[warm] spawned pid={proc.pid} (total={self._total_spawned})")
+        return proc
+
+    async def acquire(self, model: str) -> asyncio.subprocess.Process | None:
+        """Get a pre-spawned process if model matches, else None (spawn on-demand)."""
+        if model != self._model:
+            logger.debug(f"[warm] model mismatch ({model} != {self._model}), skip")
+            return None
+
+        while not self._ready.empty():
+            try:
+                proc = self._ready.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if proc.returncode is None:
+                self._total_acquired += 1
+                logger.info(
+                    f"[warm] acquired pid={proc.pid} "
+                    f"(remaining={self._ready.qsize()}, acquired={self._total_acquired})"
+                )
+                return proc
+            logger.debug(f"[warm] discarded dead pid={proc.pid}")
+
+        logger.debug("[warm] pool empty, spawn on-demand")
+        return None
+
+    async def _replenish_loop(self) -> None:
+        """Background task: keep pool at target size, discard dead processes."""
+        while True:
+            await asyncio.sleep(3)
+
+            # Drain queue, keep alive processes
+            alive = []
+            while not self._ready.empty():
+                try:
+                    proc = self._ready.get_nowait()
+                    if proc.returncode is None:
+                        alive.append(proc)
+                    else:
+                        logger.debug(f"[warm] cleaned dead pid={proc.pid}")
+                except asyncio.QueueEmpty:
+                    break
+            for proc in alive:
+                await self._ready.put(proc)
+
+            # Spawn replacements
+            deficit = self._pool_size - self._ready.qsize()
+            for _ in range(deficit):
+                try:
+                    proc = await self._spawn()
+                    if proc.returncode is None:
+                        await self._ready.put(proc)
+                except Exception as e:
+                    logger.warning(f"[warm] replenish failed: {e}")
+                    break
+
+    async def close(self) -> None:
+        """Kill all warm processes and stop replenishment."""
+        if self._replenish_task:
+            self._replenish_task.cancel()
+
+        killed = 0
+        while not self._ready.empty():
+            try:
+                proc = self._ready.get_nowait()
+                if proc.returncode is None:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                    killed += 1
+            except asyncio.QueueEmpty:
+                break
+
+        logger.info(
+            f"[warm] closed: killed={killed}, "
+            f"total_spawned={self._total_spawned}, total_acquired={self._total_acquired}"
+        )
+
+    @property
+    def available(self) -> int:
+        return self._ready.qsize()
 
 
 async def _cleanup_idle_sessions() -> None:
@@ -335,12 +514,17 @@ async def _invoke(cmd: list[str], prompt: str, timeout: float) -> dict:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _semaphore, _cleanup_task
+    global _semaphore, _cleanup_task, _warm_pool
     _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     _cleanup_task = asyncio.create_task(_cleanup_idle_sessions())
+
+    _warm_pool = WarmProcessPool(WARM_POOL_MODEL, WARM_POOL_SIZE)
+    await _warm_pool.start()
+
     logger.info(
         f"Worker started: max_concurrent={MAX_CONCURRENT}, "
         f"session_idle_timeout={SESSION_IDLE_TIMEOUT}s, "
+        f"warm_pool={WARM_POOL_SIZE} ({WARM_POOL_MODEL}), "
         f"config_dir={CLAUDE_CONFIG_DIR or 'default'}"
     )
 
@@ -351,6 +535,8 @@ async def shutdown() -> None:
     for sess in _sessions.values():
         await sess.close()
     _sessions.clear()
+    if _warm_pool:
+        await _warm_pool.close()
     if _cleanup_task:
         _cleanup_task.cancel()
 
@@ -406,6 +592,13 @@ async def health() -> dict:
         "max": MAX_CONCURRENT,
         "streaming_sessions": len(_sessions),
         "sessions": streaming_info,
+        "warm_pool": {
+            "available": _warm_pool.available if _warm_pool else 0,
+            "target": WARM_POOL_SIZE,
+            "model": WARM_POOL_MODEL,
+            "total_spawned": _warm_pool._total_spawned if _warm_pool else 0,
+            "total_acquired": _warm_pool._total_acquired if _warm_pool else 0,
+        },
         "config_dir": CLAUDE_CONFIG_DIR or "default",
     }
 
@@ -445,7 +638,9 @@ async def start_session(req: SessionRequest) -> dict:
     sess = StreamingSession(req.session_id, req.model, req.system_prompt)
     _sessions[req.session_id] = sess
 
-    result = await sess.start_and_send(req.prompt, req.timeout)
+    # Try warm pool first — saves ~3-4s subprocess spawn
+    warm_proc = await _warm_pool.acquire(req.model) if _warm_pool else None
+    result = await sess.start_and_send(req.prompt, req.timeout, warm_proc=warm_proc)
     if result.get("error"):
         # Clean up failed session
         _sessions.pop(req.session_id, None)
