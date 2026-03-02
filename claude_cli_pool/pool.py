@@ -303,6 +303,28 @@ class ClaudeCLIPool:
             timeout=self._timeout,
         )
 
+    async def close_session(self, session_id: str) -> dict:
+        """Close a streaming session on its pinned worker."""
+        async with self._lock:
+            worker_idx = self._session_map.pop(session_id, None)
+        if worker_idx is None:
+            return {"status": "not_found"}
+        worker = self._workers[worker_idx]
+        logger.debug(
+            f"[pool] close_session {session_id[:8]} → worker-{worker_idx}"
+        )
+        try:
+            s = worker._get_session(timeout=10)
+            async with s.post(
+                f"{worker._url}/close_session",
+                json={"session_id": session_id},
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                return {"status": "error", "detail": await r.text()}
+        except Exception as e:
+            return {"status": "error", "detail": str(e)}
+
     async def health_check(self) -> dict:
         """Parallel health check all workers. Updates each worker's is_healthy flag."""
         results = await asyncio.gather(

@@ -122,6 +122,10 @@ class ResumeRequest(BaseModel):
     prompt: str
 
 
+class CloseRequest(BaseModel):
+    session_id: str
+
+
 # -- Endpoints --
 
 @app.get("/health")
@@ -154,3 +158,10 @@ async def resume_session(req: ResumeRequest) -> dict:
     if resp.error:
         raise HTTPException(status_code=500, detail=resp.error)
     return {"content": resp.content}
+
+
+@app.post("/close_session")
+async def close_session(req: CloseRequest) -> dict:
+    session_uuid = _to_uuid(req.session_id)
+    resp = await _pool.close_session(session_uuid)
+    return resp

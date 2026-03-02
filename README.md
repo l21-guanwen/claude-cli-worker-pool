@@ -41,11 +41,12 @@ account-1 (~/.claude-acct1)          account-2 (~/.claude-acct2)
           └─────────── 6 worker URLs (flat list) ────────────┘
                                  │
                       Pool Service :8090
-                  ┌──────────────┴──────────────┐
-                  │  /complete   → round-robin   │
-                  │  /start_session → EWMA pick  │
-                  │  /resume_session → pinned    │
-                  └─────────────────────────────┘
+                  ┌───────────────┴───────────────┐
+                  │  /complete      → round-robin  │
+                  │  /start_session → EWMA pick    │
+                  │  /resume_session → pinned      │
+                  │  /close_session  → pinned      │
+                  └────────────────────────────────┘
                                  │
                               Client
 ```
@@ -53,12 +54,14 @@ account-1 (~/.claude-acct1)          account-2 (~/.claude-acct2)
 **Key properties:**
 
 - **Single external endpoint** — clients call `:8090` only; workers have no published ports.
+- **Hybrid execution** — `/complete` uses one-shot `subprocess.run`; sessions use persistent
+  streaming subprocesses (`--input-format stream-json`) that stay alive between messages.
 - **Round-robin for stateless calls** — `/complete` cycles worker-0 → worker-1 → … → worker-N
   → worker-0, ensuring even distribution across all accounts.
 - **EWMA routing for new sessions** — `/start_session` picks the fastest, least-loaded worker
   using `score = (active_calls + 1) × avg_response_ms`.
 - **Session affinity** — `session_id → worker_index` map ensures `/resume_session` always returns
-  to the same worker process (Claude CLI session state is stored locally on that worker).
+  to the same worker process (streaming subprocess lives on that worker).
 - **Shared `CLAUDE_CONFIG_DIR`** — workers within the same account container share one auth dir.
   Sessions are stored as UUID-named files, so concurrent workers never conflict.
 
@@ -300,6 +303,7 @@ transparently (Claude CLI requires valid UUIDs for `--session-id`).
 ### `POST /resume_session`
 
 Continue an existing session. Automatically routed to the **pinned worker** for that session ID.
+The streaming subprocess is reused — **no Node.js respawn**, just a stdin write + API inference.
 Model is carried forward from `start_session` — no override here.
 
 ```json
@@ -308,6 +312,19 @@ Model is carried forward from `start_session` — no override here.
 
 // Response
 {"content": "Based on the DCF..."}
+```
+
+### `POST /close_session`
+
+Explicitly close a streaming session and kill its subprocess. Optional — idle sessions are
+automatically cleaned up after `SESSION_IDLE_TIMEOUT` (default: 10 minutes).
+
+```json
+// Request
+{"session_id": "eval-001"}
+
+// Response
+{"status": "closed", "total_messages": 5}
 ```
 
 ---
@@ -403,67 +420,78 @@ W2 unhealthy                800          800           ∞           800   → n
 
 ### `/resume_session` — Pinned
 
-Always routes to the worker that handled `start_session` for that session ID. Claude CLI stores
-session state as a local file, so the resume must hit the exact same process.
+Always routes to the worker that handled `start_session` for that session ID. The streaming
+subprocess lives on that worker, so the resume must hit the exact same process.
+
+### `/close_session` — Pinned
+
+Routes to the pinned worker and kills the streaming subprocess. Removes the session from the
+affinity map. Optional — idle sessions are auto-cleaned after `SESSION_IDLE_TIMEOUT`.
 
 ---
 
 ## Latency
 
-### Where the time goes
+### Streaming mode — the key optimization
 
-Each `claude -p` call averages ~16s. The breakdown:
+Sessions use **streaming input mode** (`--input-format stream-json --output-format stream-json`),
+which keeps the Node.js subprocess alive between messages. This eliminates the ~3-4s subprocess
+spawn overhead on every `/resume_session` call.
 
-| Source | Time | % | Can reduce? |
-|--------|------|---|-------------|
-| Anthropic API (model inference) | 10-12s | 65-75% | Use a faster model |
-| Node.js subprocess spawn + CLI init | 2-3s | 15-20% | No — Claude CLI is one-shot by design |
-| JSON/HTTP overhead | 1-2s | ~10% | Negligible |
+```
+/complete:        subprocess.run per call  → spawns, responds, exits  (~5-7s)
+/start_session:   spawn streaming process  → responds, stays alive    (~5-7s, one-time)
+/resume_session:  write to existing stdin  → responds immediately     (~1-8s, no respawn)
+```
 
-The subprocess overhead is unavoidable — both the Python and TypeScript Claude SDKs spawn a fresh
-Node.js process per call internally. There is no persistent daemon mode for `claude -p`.
+### Per-call breakdown
 
-### CLI vs API latency
-
-This pool uses `claude -p` (CLI binary via subscription login), not the Anthropic API. Same model,
-same backend, but the CLI adds ~3-4s overhead per call:
-
-| Source | CLI (`claude -p`) | API (`anthropic.messages.create`) |
-|--------|:-:|:-:|
-| Node.js process spawn | ~2-3s | 0 |
-| CLI init + config load | ~0.5-1s | 0 |
-| Model inference (Sonnet) | 10-12s | 10-12s |
-| **Total** | **~14-16s** | **~10-12s** |
+| Source | CLI one-shot | Streaming resume | API (`messages.create`) |
+|--------|:-:|:-:|:-:|
+| Node.js process spawn | ~2-3s | 0 (reused) | 0 |
+| CLI init + config load | ~0.5-1s | 0 (reused) | 0 |
+| Model inference (Sonnet) | ~5-8s | ~5-8s | ~5-8s |
+| **Total** | **~7-12s** | **~5-8s** | **~5-8s** |
 
 The tradeoff:
-- **CLI (this pool)**: Free (subscription), 5-hour token budget per account, no API key needed
-- **API**: Pay per token, no time limit, ~25% faster per call
+- **CLI streaming (this pool)**: Free (subscription), 5-hour token budget, ~5-8s per resume
+- **CLI one-shot**: Free, ~7-12s per call (subprocess spawn overhead every time)
+- **API**: Pay per token, no time limit, ~5-8s per call
+
+### Benchmark: 18-question evaluation (session scoring)
+
+| Metric | Old Session | Streaming Session | Independent |
+|--------|:-:|:-:|:-:|
+| **Wall-clock** | 4m 34s | **3m 10s** | 3m 24s |
+| Per-question avg | 50.5s | **30.0s** | 35.6s |
+| Start session avg | ~15.1s | **6.7s (-55%)** | n/a |
+| Resume session avg | ~10.3s | **6.3s (-39%)** | n/a |
+
+Streaming session is the fastest mode overall — 31% faster than old session, 7% faster than
+independent. Two consecutive runs showed only ~3% variance.
+
+**When to use each:**
+- **Streaming session** (default): Best for most workloads — lowest per-call latency + token efficient
+- **Independent**: Best for very large pools (10+ workers) where parallelism dominates
+- **Old session**: Deprecated — streaming session is strictly better
 
 ### Per-request model override
-
-The only lever that meaningfully reduces latency is **model selection**. Haiku inference is
-~3-5s vs Sonnet's ~10-12s. For scoring/grading tasks, Haiku is often sufficient.
 
 Pass `"model"` in any `/complete` or `/start_session` request to override the pool default:
 
 ```bash
-# Default model (~14-16s)
+# Default model (~5-7s)
 curl -X POST http://localhost:8090/complete \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Score this 1-10: [response]"}'
 
-# Haiku override (~6-9s)
+# Haiku override (~3-5s)
 curl -X POST http://localhost:8090/complete \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Score this 1-10: [response]", "model": "claude-haiku-4-5-20251001"}'
 ```
 
 If `model` is empty or omitted, the pool uses the `MODEL` env var (default: `claude-sonnet-4-6`).
-
-| Model | Avg round-trip | Best for |
-|-------|---------------|----------|
-| `claude-sonnet-4-6` | ~14-16s | Complex analysis, nuanced rubric evaluation |
-| `claude-haiku-4-5-20251001` | ~6-9s | Binary scoring, numeric grading, format checks |
 
 ---
 
@@ -489,6 +517,7 @@ If `model` is empty or omitted, the pool uses the `MODEL` env var (default: `cla
 | `WORKERS_PER_ACCOUNT` | `1` | Must match the value set in pool-service |
 | `BASE_PORT` | `8000` | Must match the value set in pool-service |
 | `MAX_CONCURRENT` | `1` | Semaphore per worker process (usually leave at 1) |
+| `SESSION_IDLE_TIMEOUT` | `600` | Kill idle streaming sessions after N seconds (default: 10 min) |
 
 ---
 
@@ -497,7 +526,8 @@ If `model` is empty or omitted, the pool uses the `MODEL` env var (default: `cla
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Empty `content` in responses | `--tools ""` not passed to `claude -p` | Already handled in `worker_api.py` — do not remove |
-| `Unknown session` 500 error | `resume_session` called before `start_session` | Always call `start_session` first |
+| `Unknown session` 404 error | `resume_session` called before `start_session` | Always call `start_session` first |
+| `Streaming process died` 500 | Streaming subprocess crashed between calls | Will need a new `start_session`; check worker logs for cause |
 | `Session ID already in use` 500 | Same session ID reused across test runs | Use unique session IDs per run (e.g. add UUID suffix) |
 | Workers show `healthy: 0` | Workers still starting up | Wait 5–10s after `docker compose up`, then retry `/health` |
 | Worker score stuck at 5000 | Cold start — no successful calls yet | Normal; self-corrects after the first successful call |
@@ -523,7 +553,7 @@ claude-cli-worker-pool/
 │   ├── claude_worker/
 │   │   ├── Dockerfile           Worker image (Node.js + Claude CLI + Python FastAPI)
 │   │   ├── start_workers.sh     Spawns WORKERS_PER_ACCOUNT uvicorn processes on consecutive ports
-│   │   ├── worker_api.py        FastAPI wrapper around claude -p subprocess
+│   │   ├── worker_api.py        FastAPI wrapper: one-shot subprocess + streaming sessions
 │   │   └── requirements.txt
 │   ├── pool_service/
 │   │   ├── Dockerfile           Uses repo-root build context to include claude_cli_pool/
@@ -532,8 +562,8 @@ claude-cli-worker-pool/
 │   └── docker-compose.yml       pool-service (external :8090) + account containers (internal)
 ├── claude_cli_pool/
 │   ├── __init__.py
-│   └── pool.py                  WorkerClient (EWMA + request counter) + ClaudeCLIPool
-│                                  (round-robin for /complete, EWMA for /start_session, pinned for /resume_session)
+│   └── pool.py                  WorkerClient (EWMA + request counter) + ClaudeCLIPool (round-robin
+│                                  for /complete, EWMA for /start_session, pinned for /resume + /close)
 ├── tests/
 │   └── test_pool.py             Integration tests (5 tests, require docker compose up)
 ├── requirements.txt             aiohttp>=3.9.0
