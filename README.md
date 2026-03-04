@@ -374,6 +374,195 @@ asyncio.run(run_eval())
 
 ---
 
+## LangChain Integration
+
+The pool ships with a **LangChain `BaseChatModel` adapter** that makes it a drop-in replacement
+for `ChatOpenAI`, `ChatAnthropic`, or any other LangChain chat model. This is bundled in the
+[AIFoundation](../lintelligent_solution_AIFoundation_agent_formation) repo as a standard LLM
+provider alongside OpenAI, Anthropic, Google, etc.
+
+### How it works
+
+```
+.env MODEL_NAME=CLAUDE_CLI_POOL
+        │
+        ▼
+settings.MODEL_NAME → AsyncLLMCaller.__init__()
+        │
+        ▼
+select_model(ModelName.CLAUDE_CLI_POOL)
+        │
+        ▼
+ClaudePoolChatModel(pool_url, pool_model, pool_timeout)
+        │
+        ▼
+Each .ainvoke() call:
+  1. POST /start_session  →  grabs a warm process (~0s spawn)
+  2. Receives response     →  returns AIMessage(content=...)
+  3. POST /close_session   →  releases the process back to the pool
+```
+
+### Usage — any repo that depends on AIFoundation
+
+**1. Set `.env`:**
+
+```env
+MODEL_NAME=CLAUDE_CLI_POOL
+```
+
+**2. (Optional) Override pool settings:**
+
+```env
+CLAUDE_POOL_URL=http://localhost:8090
+CLAUDE_POOL_MODEL=claude-sonnet-4-6
+CLAUDE_POOL_TIMEOUT=300
+```
+
+That's it. No code changes needed — `select_model()` picks up `ClaudePoolChatModel` automatically.
+
+### Supported interfaces
+
+| Interface | Method | Supported |
+|-----------|--------|:---------:|
+| Plain text | `model.ainvoke(messages)` | Yes |
+| Structured output | `model.with_structured_output(MySchema).ainvoke(messages)` | Yes |
+| Synchronous | `model.invoke(messages)` | No (async only) |
+| Streaming | `model.astream(messages)` | No |
+
+**Structured output** works by injecting the JSON schema into the system prompt and parsing the
+response. The adapter handles markdown fence stripping and JSON extraction automatically.
+
+### AIFoundation files
+
+| File | Purpose |
+|------|---------|
+| `AifoundationAgent/constants.py` | `CLAUDE_CLI_POOL = "claude-cli-pool"` enum value |
+| `AifoundationAgent/llm_models/select_model.py` | Factory entry in `MODEL_CREATORS` |
+| `AifoundationAgent/llm_models/claude_cli_pool.py` | `ClaudePoolChatModel` adapter |
+
+### Performance comparison (financial_analysis_graph, META)
+
+| Metric | Claude Sonnet 4.6 (pool) | GPT-5.1 (API) |
+|--------|:------------------------:|:--------------:|
+| Total graph time | ~53s | ~35s |
+| LLM call time | ~46s | ~28s |
+| Data fetch overhead | ~7s | ~7s |
+| Populated output keys | 13/13 | 13/13 |
+
+The ~18s gap is entirely in the LLM call — Claude CLI subprocess + streaming JSON + HTTP proxy
+adds latency compared to a direct API call. Data fetch overhead (FMP API, DB queries) is identical.
+
+---
+
+## Adding More Accounts
+
+The pool scales by adding more account containers. Each account has its own independent 5-hour
+token budget.
+
+### Step 1: Authenticate the new account on the host
+
+Each account needs its own config directory:
+
+**Linux / macOS:**
+
+```bash
+mkdir -p ~/.claude-acct3
+CLAUDE_CONFIG_DIR=~/.claude-acct3 claude login
+```
+
+**Windows (PowerShell):**
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude-acct3"
+$env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-acct3"
+claude login
+```
+
+A browser window opens — log in with the new account's credentials.
+
+Verify it works:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-acct3 claude -p --max-turns 1 "say hi"
+```
+
+### Step 2: Add the account container to `docker-compose.yml`
+
+```yaml
+  account-3:
+    build: ./claude_worker
+    volumes:
+      - ${CLAUDE_CONFIG_DIR_3:-~/.claude-acct3}:/root/.claude
+    environment:
+      WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-3}"
+      BASE_PORT: "8000"
+      MAX_CONCURRENT: "1"
+      CLAUDE_CONFIG_DIR: /root/.claude
+```
+
+### Step 3: Update pool-service to include the new account
+
+```yaml
+  pool-service:
+    environment:
+      ACCOUNT_BASE_URLS: "http://account-1,http://account-2,http://account-3"
+    depends_on:
+      - account-1
+      - account-2
+      - account-3
+```
+
+### Step 4: Restart
+
+**Linux / macOS:**
+
+```bash
+cd docker/
+
+CLAUDE_CONFIG_DIR_1=~/.claude-acct1 \
+CLAUDE_CONFIG_DIR_2=~/.claude-acct2 \
+CLAUDE_CONFIG_DIR_3=~/.claude-acct3 \
+WORKERS_PER_ACCOUNT=3 \
+docker compose up -d --build
+```
+
+**Windows (PowerShell):**
+
+```powershell
+cd docker/
+
+$env:CLAUDE_CONFIG_DIR_1 = "$env:USERPROFILE\.claude-acct1"
+$env:CLAUDE_CONFIG_DIR_2 = "$env:USERPROFILE\.claude-acct2"
+$env:CLAUDE_CONFIG_DIR_3 = "$env:USERPROFILE\.claude-acct3"
+$env:WORKERS_PER_ACCOUNT = "3"
+docker compose up -d --build
+```
+
+### Step 5: Verify
+
+```bash
+curl -s http://localhost:8090/health | python -m json.tool
+```
+
+Should show `"healthy": 9, "total": 9` (3 accounts x 3 workers).
+
+### Pattern for N accounts
+
+The same pattern scales to any number. For 5 accounts:
+
+1. Create `~/.claude-acct1` through `~/.claude-acct5`, each with `claude login`
+2. Add `account-3`, `account-4`, `account-5` services to `docker-compose.yml`
+3. Set `ACCOUNT_BASE_URLS: "http://account-1,http://account-2,...,http://account-5"`
+4. Add `depends_on` entries and `CLAUDE_CONFIG_DIR_N` env vars
+5. `docker compose up -d --build`
+
+The pool service auto-discovers all workers from `ACCOUNT_BASE_URLS`. Routing handles the rest:
+- `/complete` round-robins across all workers (even account distribution)
+- `/start_session` picks the fastest worker via EWMA scoring
+- `/resume_session` stays pinned to the session's original worker
+
+---
+
 ## Capacity Planning
 
 ```
@@ -576,4 +765,11 @@ claude-cli-worker-pool/
 │   └── test_pool.py             Integration tests (5 tests, require docker compose up)
 ├── requirements.txt             aiohttp>=3.9.0
 └── README.md
+
+# In the AIFoundation repo (lintelligent_solution_AIFoundation_agent_formation):
+AifoundationAgent/
+├── constants.py                 ModelName.CLAUDE_CLI_POOL enum value
+└── llm_models/
+    ├── select_model.py          MODEL_CREATORS entry for CLAUDE_CLI_POOL
+    └── claude_cli_pool.py       ClaudePoolChatModel — LangChain BaseChatModel adapter
 ```
