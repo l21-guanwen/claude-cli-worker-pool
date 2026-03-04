@@ -80,6 +80,17 @@ here because:
 The pool service implements this in ~15 lines: a `dict[session_id → worker_index]` with an
 `asyncio.Lock`. The EWMA math is 3 lines. No frameworks needed — just `aiohttp`.
 
+### CLI tool behavior
+
+The CLI **cannot accept raw tool schemas** like the API's `tools` parameter. It can use custom
+tools through **MCP (Model Context Protocol)** — Claude Code acts as an MCP client, discovers
+tools at startup via `--mcp-config`, and handles the full tool-calling loop internally.
+
+The worker pool passes `--tools ""` to every `claude -p` call. This is critical: without it,
+the model sees Claude Code's built-in tools (Read, Write, Bash, WebSearch) and tries to use them
+instead of responding with text. Since the pool runs with `--max-turns 1`, a tool-use attempt
+returns `error_max_turns` with an empty `result` field — silently producing no output.
+
 ---
 
 ## Prerequisites

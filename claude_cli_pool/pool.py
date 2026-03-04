@@ -102,10 +102,14 @@ class WorkerClient:
 
     async def health(self) -> bool:
         try:
-            s = self._get_session(timeout=5)
-            async with s.get(f"{self._url}/health") as r:
-                self._is_healthy = r.status == 200
-                return self._is_healthy
+            # Use a dedicated short-lived session for health checks so we don't
+            # pollute the main session's timeout (which must be long for LLM calls).
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as s:
+                async with s.get(f"{self._url}/health") as r:
+                    self._is_healthy = r.status == 200
+                    return self._is_healthy
         except Exception:
             self._is_healthy = False
             return False
