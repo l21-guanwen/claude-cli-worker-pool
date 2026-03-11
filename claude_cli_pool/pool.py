@@ -30,6 +30,7 @@ _INITIAL_RESPONSE_MS = 5000.0
 class PoolResponse:
     content: str
     error: str | None = None
+    status_code: int | None = None  # HTTP status from worker (e.g. 503 = at capacity)
 
 
 @dataclass
@@ -182,7 +183,7 @@ class WorkerClient:
                                 logger.error(
                                     f"[worker] {self._url} credential error — marked unhealthy"
                                 )
-                            return PoolResponse(content="", error=f"{r.status}: {text}")
+                            return PoolResponse(content="", error=f"{r.status}: {text}", status_code=r.status)
                         data = await r.json()
                         success = True
                         return PoolResponse(content=data.get("content", ""))
@@ -277,9 +278,20 @@ class ClaudeCLIPool:
         # Round-robin across all workers for stateless calls — ensures even account usage.
         # EWMA scoring is not used here because it tends to cluster on low-index workers,
         # starving higher-index workers (and their accounts) of traffic.
+        # Unhealthy workers are skipped to avoid wasting calls on dead/expired accounts.
         async with self._lock:
             idx = self._complete_rr % len(self._workers)
-            self._complete_rr += 1
+            for _ in range(len(self._workers)):
+                candidate = self._complete_rr % len(self._workers)
+                self._complete_rr += 1
+                if self._workers[candidate]._is_healthy:
+                    idx = candidate
+                    break
+            else:
+                # All unhealthy — fall back to next in rotation
+                idx = self._complete_rr % len(self._workers)
+                self._complete_rr += 1
+                logger.warning("[pool] All workers unhealthy — complete routing to worker-%d as fallback", idx)
         worker = self._workers[idx]
         logger.debug(f"[pool] complete → worker-{idx} (rr)")
         return await worker.complete(
@@ -297,26 +309,55 @@ class ClaudeCLIPool:
         system_prompt: str = "",
         model: str = "",
     ) -> PoolResponse:
-        async with self._lock:
-            worker_idx = self._pick_worker()
-            self._session_map[session_id] = (worker_idx, time.monotonic())
-        worker = self._workers[worker_idx]
-        logger.debug(
-            f"[pool] start_session {session_id[:8]} → worker-{worker_idx} "
-            f"(score={worker.score:.0f})"
-        )
-        result = await worker.start_session(
-            session_id=session_id,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=model or self._model,
-            max_tokens=self._max_tokens,
-            timeout=self._timeout,
-        )
-        if result.error:
+        # Try workers until one accepts, retrying on 503 (at capacity).
+        tried: set[int] = set()
+        last_result: PoolResponse | None = None
+
+        while len(tried) < len(self._workers):
             async with self._lock:
-                self._session_map.pop(session_id, None)
-        return result
+                worker_idx = self._pick_worker()
+                # If best worker already tried, scan for untried one
+                if worker_idx in tried:
+                    found = False
+                    for i, w in enumerate(self._workers):
+                        if i not in tried and w._is_healthy:
+                            worker_idx = i
+                            found = True
+                            break
+                    if not found:
+                        break  # all healthy workers tried
+                self._session_map[session_id] = (worker_idx, time.monotonic())
+            tried.add(worker_idx)
+            worker = self._workers[worker_idx]
+            logger.debug(
+                f"[pool] start_session {session_id[:8]} → worker-{worker_idx} "
+                f"(score={worker.score:.0f})"
+            )
+            result = await worker.start_session(
+                session_id=session_id,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model or self._model,
+                max_tokens=self._max_tokens,
+                timeout=self._timeout,
+            )
+            if result.status_code == 503 and len(tried) < len(self._workers):
+                logger.info(
+                    f"[pool] worker-{worker_idx} at capacity, trying another "
+                    f"({len(tried)}/{len(self._workers)} tried)"
+                )
+                continue
+            if result.error:
+                async with self._lock:
+                    self._session_map.pop(session_id, None)
+            return result
+
+        # All workers tried — return last result (likely 503)
+        if last_result is None:
+            last_result = result
+        async with self._lock:
+            self._session_map.pop(session_id, None)
+        return last_result
 
     async def resume_session(self, session_id: str, prompt: str) -> PoolResponse:
         async with self._lock:
@@ -347,7 +388,10 @@ class ClaudeCLIPool:
         return result
 
     async def close_session(self, session_id: str) -> dict:
-        """Close a streaming session on its pinned worker."""
+        """Close a streaming session on its pinned worker.
+
+        Routes through WorkerClient._post() for consistent retry/semaphore handling.
+        """
         async with self._lock:
             entry = self._session_map.pop(session_id, None)
         if entry is None:
@@ -357,17 +401,12 @@ class ClaudeCLIPool:
         logger.debug(
             f"[pool] close_session {session_id[:8]} → worker-{worker_idx}"
         )
-        try:
-            s = await worker._get_session(timeout=10)
-            async with s.post(
-                f"{worker._url}/close_session",
-                json={"session_id": session_id},
-            ) as r:
-                if r.status == 200:
-                    return await r.json()
-                return {"status": "error", "detail": await r.text()}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+        result = await worker._post(
+            "/close_session", {"session_id": session_id}, timeout=10
+        )
+        if result.error:
+            return {"status": "error", "detail": result.error}
+        return {"status": "closed"}
 
     async def health_check(self) -> dict:
         """Parallel health check all workers. Updates each worker's is_healthy flag."""

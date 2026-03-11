@@ -139,7 +139,8 @@ async def health() -> dict:
 async def complete(req: CompleteRequest) -> dict:
     resp = await _pool.complete(req.prompt, req.system_prompt, model=req.model)
     if resp.error:
-        raise HTTPException(status_code=500, detail=resp.error)
+        status = resp.status_code if resp.status_code in (401, 503) else 500
+        raise HTTPException(status_code=status, detail=resp.error)
     return {"content": resp.content}
 
 
@@ -148,14 +149,19 @@ async def start_session(req: SessionRequest) -> dict:
     session_uuid = _to_uuid(req.session_id)
     resp = await _pool.start_session(session_uuid, req.prompt, req.system_prompt, model=req.model)
     if resp.error:
-        raise HTTPException(status_code=500, detail=resp.error)
+        # Propagate 503 (at capacity) so clients can distinguish from hard errors
+        status = resp.status_code if resp.status_code in (401, 503) else 500
+        raise HTTPException(status_code=status, detail=resp.error)
     return {"content": resp.content}
 
 
 @app.post("/resume_session")
 async def resume_session(req: ResumeRequest) -> dict:
     session_uuid = _to_uuid(req.session_id)
-    resp = await _pool.resume_session(session_uuid, req.prompt)
+    try:
+        resp = await _pool.resume_session(session_uuid, req.prompt)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     if resp.error:
         raise HTTPException(status_code=500, detail=resp.error)
     return {"content": resp.content}

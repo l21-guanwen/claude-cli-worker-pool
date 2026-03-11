@@ -388,41 +388,47 @@ class WarmProcessPool:
     async def _replenish_loop(self) -> None:
         """Background task: keep pool at target size, discard dead processes."""
         while True:
-            await asyncio.sleep(3)
+            try:
+                await asyncio.sleep(3)
 
-            # Drain queue, keep alive processes
-            alive = []
-            while not self._ready.empty():
-                try:
-                    proc = self._ready.get_nowait()
-                    if proc.returncode is None:
-                        alive.append(proc)
-                    else:
-                        # Reap zombie process
-                        try:
-                            proc.kill()
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            await proc.wait()
-                        except Exception:
-                            pass
-                        logger.debug(f"[warm] reaped dead pid={proc.pid}")
-                except asyncio.QueueEmpty:
-                    break
-            for proc in alive:
-                await self._ready.put(proc)
+                # Drain queue, keep alive processes
+                alive = []
+                while not self._ready.empty():
+                    try:
+                        proc = self._ready.get_nowait()
+                        if proc.returncode is None:
+                            alive.append(proc)
+                        else:
+                            # Reap zombie process
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                await proc.wait()
+                            except Exception:
+                                pass
+                            logger.debug(f"[warm] reaped dead pid={proc.pid}")
+                    except asyncio.QueueEmpty:
+                        break
+                for proc in alive:
+                    await self._ready.put(proc)
 
-            # Spawn replacements
-            deficit = self._pool_size - self._ready.qsize()
-            for _ in range(deficit):
-                try:
-                    proc = await self._spawn()
-                    if proc.returncode is None:
-                        await self._ready.put(proc)
-                except Exception as e:
-                    logger.warning(f"[warm] replenish failed: {e}")
-                    break
+                # Spawn replacements
+                deficit = self._pool_size - self._ready.qsize()
+                for _ in range(deficit):
+                    try:
+                        proc = await self._spawn()
+                        if proc.returncode is None:
+                            await self._ready.put(proc)
+                    except Exception as e:
+                        logger.warning(f"[warm] replenish failed: {e}")
+                        break
+            except asyncio.CancelledError:
+                raise  # let cancellation propagate
+            except Exception as e:
+                logger.error(f"[warm] replenish loop error: {e}")
+                await asyncio.sleep(5)  # back off before retrying
 
     async def close(self) -> None:
         """Kill all warm processes and stop replenishment."""
@@ -500,8 +506,30 @@ def _is_auth_error(error_msg: str) -> bool:
 
 
 # ============================================================
-# Subprocess invocation (stateless /complete — unchanged)
+# Subprocess invocation (stateless /complete)
 # ============================================================
+
+async def _invoke_warm(prompt: str, model: str, timeout: float) -> dict | None:
+    """Try to run a one-shot completion using a warm streaming process.
+
+    Returns the result dict, or None if warm pool is unavailable (model
+    mismatch or pool empty) — caller should fall back to subprocess.run.
+    The warm process is killed after the single response.
+    """
+    if not _warm_pool:
+        return None
+    proc = await _warm_pool.acquire(model)
+    if proc is None:
+        return None
+
+    # Use a temporary StreamingSession for the one-shot call
+    sess = StreamingSession("_complete_oneshot", model)
+    try:
+        result = await sess.start_and_send(prompt, timeout, warm_proc=proc)
+        return result
+    finally:
+        await sess.close()
+
 
 def _run_claude(cmd: list[str], prompt: str, timeout: float) -> dict:
     """Run claude -p synchronously (called via run_in_executor).
@@ -631,13 +659,16 @@ class CloseRequest(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
+    # Snapshot under lock to avoid RuntimeError from concurrent dict mutation
+    async with _sessions_lock:
+        sessions_snapshot = dict(_sessions)
     streaming_info = {
         sid[:8]: {
             "alive": sess.is_alive,
             "messages": sess.total_messages,
             "idle_s": round(time.monotonic() - sess.last_used, 1),
         }
-        for sid, sess in _sessions.items()
+        for sid, sess in sessions_snapshot.items()
     }
     return {
         "status": "ok",
@@ -659,23 +690,45 @@ async def health() -> dict:
 
 @app.post("/complete")
 async def complete(req: CompleteRequest) -> dict:
-    """Stateless single-turn completion (subprocess.run — one process per call)."""
-    cmd = [
-        CLAUDE_BIN, "-p",
-        "--output-format", "json",
-        "--max-turns", "1",
-        "--model", req.model,
-        "--no-session-persistence",
-        "--tools", "",
-    ]
+    """Stateless single-turn completion.
+
+    Tries warm pool first (~0s spawn). Falls back to subprocess.run (~3-4s)
+    if warm pool is empty or model doesn't match.
+    Both paths share a single semaphore slot for accurate active count.
+    """
+    global _active
     prompt = req.prompt
     if req.system_prompt:
         prompt = f"<system-context>\n{req.system_prompt}\n</system-context>\n\n{req.prompt}"
-    result = await _invoke(cmd, prompt, req.timeout)
-    if result.get("error"):
-        status = 401 if _is_auth_error(result["error"]) else 500
-        raise HTTPException(status_code=status, detail=result["error"])
-    return {"content": result["content"]}
+
+    async with _semaphore:
+        _active += 1
+        try:
+            # Try warm pool path (streaming process, one-shot)
+            result = await _invoke_warm(prompt, req.model, req.timeout)
+            if result is not None:
+                if result.get("error"):
+                    status = 401 if _is_auth_error(result["error"]) else 500
+                    raise HTTPException(status_code=status, detail=result["error"])
+                return {"content": result["content"]}
+
+            # Fallback: subprocess.run (cold start) — run in thread pool
+            cmd = [
+                CLAUDE_BIN, "-p",
+                "--output-format", "json",
+                "--max-turns", "1",
+                "--model", req.model,
+                "--no-session-persistence",
+                "--tools", "",
+            ]
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, _run_claude, cmd, prompt, req.timeout)
+            if result.get("error"):
+                status = 401 if _is_auth_error(result["error"]) else 500
+                raise HTTPException(status_code=status, detail=result["error"])
+            return {"content": result["content"]}
+        finally:
+            _active -= 1
 
 
 @app.post("/start_session")
@@ -688,23 +741,23 @@ async def start_session(req: SessionRequest) -> dict:
     """
     global _streaming_count
 
-    if _streaming_count >= MAX_CONCURRENT:
-        raise HTTPException(
-            status_code=503,
-            detail=f"At session capacity ({MAX_CONCURRENT})",
-        )
-
-    # Close existing session with same ID if any
+    # Atomic check-and-increment under lock to prevent TOCTOU race
     async with _sessions_lock:
+        if _streaming_count >= MAX_CONCURRENT:
+            raise HTTPException(
+                status_code=503,
+                detail=f"At session capacity ({MAX_CONCURRENT})",
+            )
         old = _sessions.pop(req.session_id, None)
-    if old:
-        _streaming_count = max(0, _streaming_count - 1)
-        await old.close()
-
-    _streaming_count += 1
-    sess = StreamingSession(req.session_id, req.model, req.system_prompt)
-    async with _sessions_lock:
+        if old:
+            _streaming_count = max(0, _streaming_count - 1)
+        _streaming_count += 1
+        sess = StreamingSession(req.session_id, req.model, req.system_prompt)
         _sessions[req.session_id] = sess
+
+    # Close old session outside lock to avoid holding it during I/O
+    if old:
+        await old.close()
 
     # Try warm pool first — saves ~3-4s subprocess spawn
     warm_proc = await _warm_pool.acquire(req.model) if _warm_pool else None
