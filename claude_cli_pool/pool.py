@@ -58,6 +58,7 @@ class WorkerClient:
         self._avg_response_ms = _INITIAL_RESPONSE_MS
         self._is_healthy = True  # updated by pool health checks
         self._session: aiohttp.ClientSession | None = None  # lazy singleton
+        self._session_lock = asyncio.Lock()
 
     @property
     def active(self) -> int:
@@ -87,18 +88,21 @@ class WorkerClient:
             _EWMA_ALPHA * elapsed_ms + (1 - _EWMA_ALPHA) * self._avg_response_ms
         )
 
-    def _get_session(self, timeout: float = 300.0) -> aiohttp.ClientSession:
+    async def _get_session(self, timeout: float = 300.0) -> aiohttp.ClientSession:
         """Lazily create and reuse a single ClientSession per worker."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=timeout + 10),
-            )
-        return self._session
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout + 10),
+                )
+            return self._session
 
     async def close(self) -> None:
         """Close the persistent HTTP session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                await self._session.close()
+            self._session = None
 
     async def health(self) -> bool:
         try:
@@ -160,28 +164,46 @@ class WorkerClient:
         return await self._post("/resume_session", payload, timeout)
 
     async def _post(self, endpoint: str, payload: dict, timeout: float) -> PoolResponse:
-        async with self._sem:
-            self._active += 1
-            t0 = time.monotonic()
-            success = False
-            try:
-                s = self._get_session(timeout)
-                async with s.post(f"{self._url}{endpoint}", json=payload) as r:
-                    if r.status != 200:
-                        text = await r.text()
-                        # Don't update EWMA on errors — they skew latency down
-                        return PoolResponse(content="", error=f"{r.status}: {text}")
-                    data = await r.json()
-                    success = True
-                    return PoolResponse(content=data.get("content", ""))
-            except Exception as e:
-                return PoolResponse(content="", error=str(e))
-            finally:
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                if success:
-                    self._update_latency(elapsed_ms)
-                    self._total_requests += 1
-                self._active -= 1
+        last_error: str | None = None
+        for attempt in range(2):  # at most 1 retry on transient connection error
+            async with self._sem:
+                self._active += 1
+                t0 = time.monotonic()
+                success = False
+                try:
+                    s = await self._get_session(timeout)
+                    async with s.post(f"{self._url}{endpoint}", json=payload) as r:
+                        if r.status != 200:
+                            text = await r.text()
+                            if r.status == 401:
+                                # Auth/credential error — mark worker unhealthy immediately
+                                # so pool stops routing here until health check recovers it
+                                self._is_healthy = False
+                                logger.error(
+                                    f"[worker] {self._url} credential error — marked unhealthy"
+                                )
+                            return PoolResponse(content="", error=f"{r.status}: {text}")
+                        data = await r.json()
+                        success = True
+                        return PoolResponse(content=data.get("content", ""))
+                except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError) as e:
+                    last_error = str(e)
+                    logger.warning(
+                        f"[worker] {self._url}{endpoint} attempt {attempt + 1} "
+                        f"connection error: {e}"
+                    )
+                except Exception as e:
+                    return PoolResponse(content="", error=str(e))
+                finally:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    if success:
+                        self._update_latency(elapsed_ms)
+                        self._total_requests += 1
+                    self._active -= 1
+            # Brief pause before retry
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+        return PoolResponse(content="", error=f"connection failed after retry: {last_error}")
 
 
 class ClaudeCLIPool:
@@ -219,9 +241,11 @@ class ClaudeCLIPool:
         self._workers = [
             WorkerClient(url, max_concurrent_per_worker) for url in worker_urls
         ]
-        self._session_map: dict[str, int] = {}  # session_id -> worker_index
+        self._session_map: dict[str, tuple[int, float]] = {}  # session_id -> (worker_idx, created_at)
         self._lock = asyncio.Lock()
         self._complete_rr: int = 0  # round-robin counter for stateless complete() calls
+        self._sweep_task: asyncio.Task | None = None
+        self._session_map_ttl = 3600.0  # 1 hour max session lifetime in map
         logger.info(
             f"ClaudeCLIPool: {len(self._workers)} workers, "
             f"{max_concurrent_per_worker} concurrent/worker"
@@ -275,13 +299,13 @@ class ClaudeCLIPool:
     ) -> PoolResponse:
         async with self._lock:
             worker_idx = self._pick_worker()
-            self._session_map[session_id] = worker_idx
+            self._session_map[session_id] = (worker_idx, time.monotonic())
         worker = self._workers[worker_idx]
         logger.debug(
             f"[pool] start_session {session_id[:8]} → worker-{worker_idx} "
             f"(score={worker.score:.0f})"
         )
-        return await worker.start_session(
+        result = await worker.start_session(
             session_id=session_id,
             prompt=prompt,
             system_prompt=system_prompt,
@@ -289,36 +313,52 @@ class ClaudeCLIPool:
             max_tokens=self._max_tokens,
             timeout=self._timeout,
         )
+        if result.error:
+            async with self._lock:
+                self._session_map.pop(session_id, None)
+        return result
 
     async def resume_session(self, session_id: str, prompt: str) -> PoolResponse:
         async with self._lock:
-            worker_idx = self._session_map.get(session_id)
-        if worker_idx is None:
+            entry = self._session_map.get(session_id)
+        if entry is None:
             raise RuntimeError(
                 f"[pool] Unknown session: {session_id} — call start_session first"
             )
+        worker_idx, _ = entry
         worker = self._workers[worker_idx]
         logger.debug(
             f"[pool] resume_session {session_id[:8]} → worker-{worker_idx} (pinned)"
         )
-        return await worker.resume_session(
+        result = await worker.resume_session(
             session_id=session_id,
             prompt=prompt,
             timeout=self._timeout,
         )
+        if result.error:
+            # If worker is unreachable, remove stale session mapping
+            is_healthy = await worker.health()
+            if not is_healthy:
+                async with self._lock:
+                    self._session_map.pop(session_id, None)
+                logger.warning(
+                    f"[pool] worker-{worker_idx} dead, removed session {session_id[:8]}"
+                )
+        return result
 
     async def close_session(self, session_id: str) -> dict:
         """Close a streaming session on its pinned worker."""
         async with self._lock:
-            worker_idx = self._session_map.pop(session_id, None)
-        if worker_idx is None:
+            entry = self._session_map.pop(session_id, None)
+        if entry is None:
             return {"status": "not_found"}
+        worker_idx, _ = entry
         worker = self._workers[worker_idx]
         logger.debug(
             f"[pool] close_session {session_id[:8]} → worker-{worker_idx}"
         )
         try:
-            s = worker._get_session(timeout=10)
+            s = await worker._get_session(timeout=10)
             async with s.post(
                 f"{worker._url}/close_session",
                 json={"session_id": session_id},
@@ -344,8 +384,30 @@ class ClaudeCLIPool:
             "workers": worker_stats,
         }
 
+    async def start(self) -> None:
+        """Start background tasks (session map sweep). Call from app startup."""
+        self._sweep_task = asyncio.create_task(self._sweep_stale_sessions())
+        logger.info("[pool] started session map sweep task")
+
+    async def _sweep_stale_sessions(self) -> None:
+        """Background task: remove stale entries from session map."""
+        while True:
+            await asyncio.sleep(300)  # every 5 min
+            now = time.monotonic()
+            async with self._lock:
+                stale = [
+                    sid for sid, (_, created_at) in self._session_map.items()
+                    if now - created_at > self._session_map_ttl
+                ]
+                for sid in stale:
+                    self._session_map.pop(sid)
+            if stale:
+                logger.info(f"[pool] swept {len(stale)} stale session(s) from map")
+
     async def close(self) -> None:
-        """Close all worker HTTP sessions."""
+        """Close all worker HTTP sessions and stop background tasks."""
+        if self._sweep_task:
+            self._sweep_task.cancel()
         await asyncio.gather(*[w.close() for w in self._workers])
 
     @property

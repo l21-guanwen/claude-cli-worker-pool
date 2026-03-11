@@ -34,7 +34,6 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 SESSION_IDLE_TIMEOUT = float(os.environ.get("SESSION_IDLE_TIMEOUT", "600"))  # 10 min
-WARM_POOL_SIZE = int(os.environ.get("WARM_POOL_SIZE", "2"))
 WARM_POOL_MODEL = os.environ.get("WARM_POOL_MODEL", "claude-sonnet-4-6")
 
 _semaphore: asyncio.Semaphore | None = None
@@ -274,6 +273,8 @@ class StreamingSession:
 
 # Session store: session_id -> StreamingSession
 _sessions: dict[str, StreamingSession] = {}
+_sessions_lock = asyncio.Lock()
+_streaming_count = 0
 _cleanup_task: asyncio.Task | None = None
 _warm_pool: "WarmProcessPool | None" = None
 
@@ -370,7 +371,16 @@ class WarmProcessPool:
                     f"(remaining={self._ready.qsize()}, acquired={self._total_acquired})"
                 )
                 return proc
-            logger.debug(f"[warm] discarded dead pid={proc.pid}")
+            # Reap zombie process
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            logger.debug(f"[warm] reaped dead pid={proc.pid}")
 
         logger.debug("[warm] pool empty, spawn on-demand")
         return None
@@ -388,7 +398,16 @@ class WarmProcessPool:
                     if proc.returncode is None:
                         alive.append(proc)
                     else:
-                        logger.debug(f"[warm] cleaned dead pid={proc.pid}")
+                        # Reap zombie process
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await proc.wait()
+                        except Exception:
+                            pass
+                        logger.debug(f"[warm] reaped dead pid={proc.pid}")
                 except asyncio.QueueEmpty:
                     break
             for proc in alive:
@@ -436,18 +455,48 @@ class WarmProcessPool:
 
 async def _cleanup_idle_sessions() -> None:
     """Background task: kill sessions idle longer than SESSION_IDLE_TIMEOUT."""
+    global _streaming_count
     while True:
         await asyncio.sleep(60)
         now = time.monotonic()
-        to_remove = [
-            sid for sid, sess in _sessions.items()
-            if now - sess.last_used > SESSION_IDLE_TIMEOUT
-        ]
-        for sid in to_remove:
-            sess = _sessions.pop(sid, None)
-            if sess:
-                await sess.close()
-                logger.info(f"[stream] cleaned up idle session {sid[:8]}")
+        async with _sessions_lock:
+            to_remove = [
+                sid for sid, sess in _sessions.items()
+                if now - sess.last_used > SESSION_IDLE_TIMEOUT
+            ]
+            removed = {sid: _sessions.pop(sid) for sid in to_remove if sid in _sessions}
+        for sid, sess in removed.items():
+            _streaming_count = max(0, _streaming_count - 1)
+            await sess.close()
+            logger.info(f"[stream] cleaned up idle session {sid[:8]}")
+
+
+# ============================================================
+# Error classification
+# ============================================================
+
+# Patterns that indicate the account credential is invalid/expired.
+# Claude CLI embeds these in the is_error result string or stderr.
+_AUTH_ERROR_PATTERNS = (
+    "invalid api key",
+    "api key expired",
+    "authentication",
+    "unauthorized",
+    "not authenticated",
+    "credential",
+    "login required",
+    "session expired",
+    "token expired",
+    "account suspended",
+    "account disabled",
+    "permission denied",
+)
+
+
+def _is_auth_error(error_msg: str) -> bool:
+    """Check if an error message indicates an account credential problem."""
+    lower = error_msg.lower()
+    return any(pat in lower for pat in _AUTH_ERROR_PATTERNS)
 
 
 # ============================================================
@@ -518,23 +567,27 @@ async def startup() -> None:
     _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     _cleanup_task = asyncio.create_task(_cleanup_idle_sessions())
 
-    _warm_pool = WarmProcessPool(WARM_POOL_MODEL, WARM_POOL_SIZE)
+    _warm_pool = WarmProcessPool(WARM_POOL_MODEL, MAX_CONCURRENT)
     await _warm_pool.start()
 
     logger.info(
         f"Worker started: max_concurrent={MAX_CONCURRENT}, "
         f"session_idle_timeout={SESSION_IDLE_TIMEOUT}s, "
-        f"warm_pool={WARM_POOL_SIZE} ({WARM_POOL_MODEL}), "
+        f"warm_pool={MAX_CONCURRENT} ({WARM_POOL_MODEL}), "
         f"config_dir={CLAUDE_CONFIG_DIR or 'default'}"
     )
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    global _streaming_count
     # Kill all streaming sessions
-    for sess in _sessions.values():
+    async with _sessions_lock:
+        all_sessions = list(_sessions.values())
+        _sessions.clear()
+        _streaming_count = 0
+    for sess in all_sessions:
         await sess.close()
-    _sessions.clear()
     if _warm_pool:
         await _warm_pool.close()
     if _cleanup_task:
@@ -591,10 +644,11 @@ async def health() -> dict:
         "active": _active,
         "max": MAX_CONCURRENT,
         "streaming_sessions": len(_sessions),
+        "streaming_count": _streaming_count,
         "sessions": streaming_info,
         "warm_pool": {
             "available": _warm_pool.available if _warm_pool else 0,
-            "target": WARM_POOL_SIZE,
+            "target": MAX_CONCURRENT,
             "model": WARM_POOL_MODEL,
             "total_spawned": _warm_pool._total_spawned if _warm_pool else 0,
             "total_acquired": _warm_pool._total_acquired if _warm_pool else 0,
@@ -619,7 +673,8 @@ async def complete(req: CompleteRequest) -> dict:
         prompt = f"<system-context>\n{req.system_prompt}\n</system-context>\n\n{req.prompt}"
     result = await _invoke(cmd, prompt, req.timeout)
     if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
+        status = 401 if _is_auth_error(result["error"]) else 500
+        raise HTTPException(status_code=status, detail=result["error"])
     return {"content": result["content"]}
 
 
@@ -629,23 +684,39 @@ async def start_session(req: SessionRequest) -> dict:
 
     The subprocess stays alive for subsequent /resume_session calls,
     eliminating the ~3-4s respawn overhead per resume.
+    Capped at MAX_CONCURRENT active streaming sessions per worker.
     """
+    global _streaming_count
+
+    if _streaming_count >= MAX_CONCURRENT:
+        raise HTTPException(
+            status_code=503,
+            detail=f"At session capacity ({MAX_CONCURRENT})",
+        )
+
     # Close existing session with same ID if any
-    old = _sessions.pop(req.session_id, None)
+    async with _sessions_lock:
+        old = _sessions.pop(req.session_id, None)
     if old:
+        _streaming_count = max(0, _streaming_count - 1)
         await old.close()
 
+    _streaming_count += 1
     sess = StreamingSession(req.session_id, req.model, req.system_prompt)
-    _sessions[req.session_id] = sess
+    async with _sessions_lock:
+        _sessions[req.session_id] = sess
 
     # Try warm pool first — saves ~3-4s subprocess spawn
     warm_proc = await _warm_pool.acquire(req.model) if _warm_pool else None
     result = await sess.start_and_send(req.prompt, req.timeout, warm_proc=warm_proc)
     if result.get("error"):
         # Clean up failed session
-        _sessions.pop(req.session_id, None)
+        async with _sessions_lock:
+            _sessions.pop(req.session_id, None)
+        _streaming_count = max(0, _streaming_count - 1)
         await sess.close()
-        raise HTTPException(status_code=500, detail=result["error"])
+        status = 401 if _is_auth_error(result["error"]) else 500
+        raise HTTPException(status_code=status, detail=result["error"])
     return {"content": result["content"]}
 
 
@@ -656,14 +727,19 @@ async def resume_session(req: ResumeRequest) -> dict:
     The message is written directly to the persistent subprocess's stdin.
     This saves ~3-4s per call vs spawning a new claude process.
     """
-    sess = _sessions.get(req.session_id)
+    global _streaming_count
+
+    async with _sessions_lock:
+        sess = _sessions.get(req.session_id)
     if not sess:
         raise HTTPException(
             status_code=404,
             detail=f"Unknown session: {req.session_id} — call /start_session first",
         )
     if not sess.is_alive:
-        _sessions.pop(req.session_id, None)
+        async with _sessions_lock:
+            _sessions.pop(req.session_id, None)
+        _streaming_count = max(0, _streaming_count - 1)
         raise HTTPException(
             status_code=500,
             detail=f"Streaming process for session {req.session_id[:8]} died",
@@ -678,8 +754,12 @@ async def resume_session(req: ResumeRequest) -> dict:
 @app.post("/close_session")
 async def close_session(req: CloseRequest) -> dict:
     """Explicitly close a streaming session and kill its subprocess."""
-    sess = _sessions.pop(req.session_id, None)
+    global _streaming_count
+
+    async with _sessions_lock:
+        sess = _sessions.pop(req.session_id, None)
     if sess:
+        _streaming_count = max(0, _streaming_count - 1)
         await sess.close()
         return {"status": "closed", "total_messages": sess.total_messages}
     return {"status": "not_found"}

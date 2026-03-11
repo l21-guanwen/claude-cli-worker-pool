@@ -93,6 +93,7 @@ async def startup() -> None:
         timeout=float(os.environ.get("TIMEOUT", "300")),
         max_concurrent_per_worker=int(os.environ.get("MAX_CONCURRENT_PER_WORKER", "5")),
     )
+    await _pool.start()
     logger.info(f"Pool service started: {len(worker_urls)} workers")
 
 

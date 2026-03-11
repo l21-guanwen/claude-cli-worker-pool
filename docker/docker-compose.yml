@@ -36,7 +36,7 @@ services:
       WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-5}"
       BASE_PORT: "8000"
       MAX_CONCURRENT: "3"
-      WARM_POOL_SIZE: "8"
+
       WARM_POOL_MODEL: "claude-sonnet-4-6"
       CLAUDE_CONFIG_DIR: /root/.claude
 
@@ -48,6 +48,6 @@ services:
       WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-5}"
       BASE_PORT: "8000"
       MAX_CONCURRENT: "3"
-      WARM_POOL_SIZE: "8"
+
       WARM_POOL_MODEL: "claude-sonnet-4-6"
       CLAUDE_CONFIG_DIR: /root/.claude
