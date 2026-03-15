@@ -21,8 +21,9 @@ services:
       WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-5}"
       BASE_PORT: "8000"
       MODEL: "claude-sonnet-4-6"
-      TIMEOUT: "300"
+      TIMEOUT: "380"
       MAX_TOKENS: "8192"
+      MAX_CONCURRENT_PER_WORKER: "5"
     depends_on:
       - account-1
       - account-2
@@ -35,7 +36,7 @@ services:
     environment:
       WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-5}"
       BASE_PORT: "8000"
-      MAX_CONCURRENT: "3"
+      MAX_CONCURRENT: "5"
 
       WARM_POOL_MODEL: "claude-sonnet-4-6"
       CLAUDE_CONFIG_DIR: /root/.claude
@@ -47,7 +48,7 @@ services:
     environment:
       WORKERS_PER_ACCOUNT: "${WORKERS_PER_ACCOUNT:-5}"
       BASE_PORT: "8000"
-      MAX_CONCURRENT: "3"
+      MAX_CONCURRENT: "5"
 
       WARM_POOL_MODEL: "claude-sonnet-4-6"
       CLAUDE_CONFIG_DIR: /root/.claude

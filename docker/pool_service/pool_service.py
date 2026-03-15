@@ -109,6 +109,7 @@ class CompleteRequest(BaseModel):
     prompt: str
     system_prompt: str = ""
     model: str = ""  # per-request override; empty = use pool default
+    timeout: float = 0.0  # per-request timeout in seconds; 0 = use pool default
 
 
 class SessionRequest(BaseModel):
@@ -137,7 +138,7 @@ async def health() -> dict:
 
 @app.post("/complete")
 async def complete(req: CompleteRequest) -> dict:
-    resp = await _pool.complete(req.prompt, req.system_prompt, model=req.model)
+    resp = await _pool.complete(req.prompt, req.system_prompt, model=req.model, timeout=req.timeout)
     if resp.error:
         status = resp.status_code if resp.status_code in (401, 503) else 500
         raise HTTPException(status_code=status, detail=resp.error)

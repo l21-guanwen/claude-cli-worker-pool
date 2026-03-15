@@ -120,6 +120,7 @@ class StreamingSession:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    limit=1024 * 1024,  # 1MB — default 64KB too small for large LLM responses
                 )
 
             # Prepend system context to first message (same as /complete)
@@ -262,7 +263,10 @@ class StreamingSession:
                 self._proc.terminate()
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self._proc.kill()
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
             except Exception:
                 pass
         logger.debug(
@@ -348,6 +352,7 @@ class WarmProcessPool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            limit=1024 * 1024,  # 1MB — default 64KB too small for large LLM responses
         )
         self._total_spawned += 1
         logger.debug(f"[warm] spawned pid={proc.pid} (total={self._total_spawned})")

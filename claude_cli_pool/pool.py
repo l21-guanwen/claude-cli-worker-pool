@@ -274,32 +274,65 @@ class ClaudeCLIPool:
             logger.debug(f"[pool] Picked worker-{best_idx} (score={best_score:.0f})")
         return best_idx
 
-    async def complete(self, prompt: str, system_prompt: str = "", model: str = "") -> PoolResponse:
-        # Round-robin across all workers for stateless calls — ensures even account usage.
-        # EWMA scoring is not used here because it tends to cluster on low-index workers,
-        # starving higher-index workers (and their accounts) of traffic.
-        # Unhealthy workers are skipped to avoid wasting calls on dead/expired accounts.
-        async with self._lock:
-            idx = self._complete_rr % len(self._workers)
-            for _ in range(len(self._workers)):
-                candidate = self._complete_rr % len(self._workers)
-                self._complete_rr += 1
-                if self._workers[candidate]._is_healthy:
-                    idx = candidate
-                    break
+    async def complete(self, prompt: str, system_prompt: str = "", model: str = "", timeout: float = 0.0) -> PoolResponse:
+        """Stateless completion via round-robin routing.
+
+        Round-robin ensures even account usage (EWMA would cluster on
+        low-index workers). If the selected worker returns 503, tries
+        remaining workers then waits and retries — same pattern as
+        start_session.
+        """
+        effective_timeout = timeout if timeout > 0 else self._timeout
+        max_attempts = 4
+        wait_between = 15
+
+        for attempt in range(max_attempts):
+            tried: set[int] = set()
+            result: PoolResponse | None = None
+
+            while len(tried) < len(self._workers):
+                async with self._lock:
+                    # Round-robin, skipping unhealthy and already-tried
+                    idx = None
+                    for _ in range(len(self._workers)):
+                        candidate = self._complete_rr % len(self._workers)
+                        self._complete_rr += 1
+                        if candidate not in tried and self._workers[candidate]._is_healthy:
+                            idx = candidate
+                            break
+                    if idx is None:
+                        break  # all tried or unhealthy
+
+                tried.add(idx)
+                worker = self._workers[idx]
+                logger.debug(f"[pool] complete → worker-{idx} (rr)")
+                result = await worker.complete(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=model or self._model,
+                    max_tokens=self._max_tokens,
+                    timeout=effective_timeout,
+                )
+                if result.status_code == 503:
+                    logger.info(
+                        f"[pool] worker-{idx} at capacity for complete, trying another "
+                        f"({len(tried)}/{len(self._workers)} tried)"
+                    )
+                    continue
+                return result  # success or hard error
+
+            # All workers at capacity — wait and retry
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    f"[pool] All workers at capacity for complete, "
+                    f"waiting {wait_between}s (attempt {attempt + 1}/{max_attempts})"
+                )
+                await asyncio.sleep(wait_between)
             else:
-                # All unhealthy — fall back to next in rotation
-                idx = self._complete_rr % len(self._workers)
-                self._complete_rr += 1
-                logger.warning("[pool] All workers unhealthy — complete routing to worker-%d as fallback", idx)
-        worker = self._workers[idx]
-        logger.debug(f"[pool] complete → worker-{idx} (rr)")
-        return await worker.complete(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=model or self._model,
-            max_tokens=self._max_tokens,
-            timeout=self._timeout,
+                logger.error(f"[pool] All workers at capacity for complete after {max_attempts} attempts")
+
+        return result or PoolResponse(
+            content="", error="All workers at capacity after retry", status_code=503
         )
 
     async def start_session(
@@ -309,55 +342,81 @@ class ClaudeCLIPool:
         system_prompt: str = "",
         model: str = "",
     ) -> PoolResponse:
-        # Try workers until one accepts, retrying on 503 (at capacity).
-        tried: set[int] = set()
-        last_result: PoolResponse | None = None
+        """Start a session on the least-loaded worker.
 
-        while len(tried) < len(self._workers):
-            async with self._lock:
-                worker_idx = self._pick_worker()
-                # If best worker already tried, scan for untried one
-                if worker_idx in tried:
-                    found = False
-                    for i, w in enumerate(self._workers):
-                        if i not in tried and w._is_healthy:
-                            worker_idx = i
-                            found = True
-                            break
-                    if not found:
-                        break  # all healthy workers tried
-                self._session_map[session_id] = (worker_idx, time.monotonic())
-            tried.add(worker_idx)
-            worker = self._workers[worker_idx]
-            logger.debug(
-                f"[pool] start_session {session_id[:8]} → worker-{worker_idx} "
-                f"(score={worker.score:.0f})"
-            )
-            result = await worker.start_session(
-                session_id=session_id,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                model=model or self._model,
-                max_tokens=self._max_tokens,
-                timeout=self._timeout,
-            )
-            if result.status_code == 503 and len(tried) < len(self._workers):
-                logger.info(
-                    f"[pool] worker-{worker_idx} at capacity, trying another "
-                    f"({len(tried)}/{len(self._workers)} tried)"
-                )
-                continue
-            if result.error:
+        If all workers are at capacity (503), waits and retries up to
+        ``_session_queue_timeout`` seconds instead of failing immediately.
+        This absorbs traffic bursts without returning errors to callers.
+        """
+        max_attempts = 6  # try up to 6 rounds (30s apart = 3 min max wait)
+        wait_between = 30  # seconds to wait when all workers are full
+
+        for attempt in range(max_attempts):
+            tried: set[int] = set()
+            result: PoolResponse | None = None
+
+            while len(tried) < len(self._workers):
                 async with self._lock:
-                    self._session_map.pop(session_id, None)
-            return result
+                    worker_idx = self._pick_worker()
+                    # If best worker already tried, scan for untried one
+                    if worker_idx in tried:
+                        found = False
+                        for i, w in enumerate(self._workers):
+                            if i not in tried and w._is_healthy:
+                                worker_idx = i
+                                found = True
+                                break
+                        if not found:
+                            break  # all healthy workers tried
+                    self._session_map[session_id] = (worker_idx, time.monotonic())
+                tried.add(worker_idx)
+                worker = self._workers[worker_idx]
+                logger.debug(
+                    f"[pool] start_session {session_id[:8]} → worker-{worker_idx} "
+                    f"(score={worker.score:.0f})"
+                )
+                result = await worker.start_session(
+                    session_id=session_id,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    model=model or self._model,
+                    max_tokens=self._max_tokens,
+                    timeout=self._timeout,
+                )
+                if result.status_code == 503 and len(tried) < len(self._workers):
+                    logger.info(
+                        f"[pool] worker-{worker_idx} at capacity, trying another "
+                        f"({len(tried)}/{len(self._workers)} tried)"
+                    )
+                    continue
+                if result.error and result.status_code != 503:
+                    # Hard error (not capacity) — fail immediately
+                    async with self._lock:
+                        self._session_map.pop(session_id, None)
+                    return result
+                if not result.error:
+                    return result  # success
 
-        # All workers tried — return last result (likely 503)
-        if last_result is None:
-            last_result = result
+            # All workers at capacity — wait and retry instead of failing
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    f"[pool] All workers at capacity for {session_id[:8]}, "
+                    f"waiting {wait_between}s before retry "
+                    f"(attempt {attempt + 1}/{max_attempts})"
+                )
+                await asyncio.sleep(wait_between)
+            else:
+                logger.error(
+                    f"[pool] All workers at capacity for {session_id[:8]} "
+                    f"after {max_attempts} attempts — giving up"
+                )
+
+        # Exhausted all retries
         async with self._lock:
             self._session_map.pop(session_id, None)
-        return last_result
+        return result or PoolResponse(
+            content="", error="All workers at capacity after retry", status_code=503
+        )
 
     async def resume_session(self, session_id: str, prompt: str) -> PoolResponse:
         async with self._lock:
